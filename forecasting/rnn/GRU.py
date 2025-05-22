@@ -1,3 +1,5 @@
+# To BE : TSlib Covention 팔로우하도록 재수정 필요
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
