@@ -1,196 +1,140 @@
-'''
-This file contains the implementation of the TiDE model.
-Original paper: https://arxiv.org/pdf/2304.08424.pdf
-'''
-
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
-class ResidualBlock(nn.Module):
-    '''
-    The Residual block is the basic building block of TiDE.
-    In feature projection, the out_features, is usually lower than in_features.
-    '''
-    def __init__(self, in_features, hid_features, out_features, dropout_prob=0.5):
-        super(ResidualBlock, self).__init__()
-        self.fc1 = nn.Linear(in_features, hid_features)
-        self.relu1 = nn.ReLU(inplace=True)
-        self.fc2 = nn.Linear(hid_features, out_features)
-        self.dropout = nn.Dropout(p=dropout_prob)
-        self.norm = nn.LayerNorm(out_features)
 
-        # Shortcut connection
-        self.shortcut = nn.Identity()
-        if in_features != out_features:
-            self.shortcut = nn.Linear(in_features, out_features)
+class LayerNorm(nn.Module):
+    """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
 
+    def __init__(self, ndim, bias):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(ndim))
+        self.bias = nn.Parameter(torch.zeros(ndim)) if bias else None
+
+    def forward(self, input):
+        return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+
+
+
+class ResBlock(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim, dropout=0.1, bias=True): 
+        super().__init__()
+
+        self.fc1 = nn.Linear(input_dim, hidden_dim, bias=bias) 
+        self.fc2 = nn.Linear(hidden_dim, output_dim, bias=bias)
+        self.fc3 = nn.Linear(input_dim, output_dim, bias=bias)
+        self.dropout = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
+        self.ln = LayerNorm(output_dim, bias=bias)
+        
     def forward(self, x):
-        residual = x
+
         out = self.fc1(x)
-        out = self.relu1(out)
+        out = self.relu(out)
         out = self.fc2(out)
         out = self.dropout(out)
-        out += self.shortcut(residual)
-        out = self.norm(out)
+        out = out + self.fc3(x)
+        out = self.ln(out)
         return out
+
+
+#TiDE
+class Model(nn.Module):  
+    """
+    paper: https://arxiv.org/pdf/2304.08424.pdf 
+    """
+    def __init__(self, configs, bias=True, feature_encode_dim=2): 
+        super(Model, self).__init__()
+        self.configs = configs
+        self.task_name = configs.task_name
+        self.seq_len = configs.seq_len  #L 
+        self.label_len = configs.label_len
+        self.pred_len = configs.pred_len  #H 
+        self.hidden_dim=configs.d_model
+        self.res_hidden=configs.d_model 
+        self.encoder_num=configs.e_layers
+        self.decoder_num=configs.d_layers
+        self.freq=configs.freq
+        self.feature_encode_dim=feature_encode_dim
+        self.decode_dim = configs.c_out
+        self.temporalDecoderHidden=configs.d_ff
+        dropout=configs.dropout
+
+        
+        freq_map = {'h': 4, 't': 5, 's': 6,
+                    'm': 1, 'a': 1, 'w': 2, 'd': 3, 'b': 3}
+        
+        self.feature_dim=freq_map[self.freq]
+
+
+        flatten_dim = self.seq_len + (self.seq_len + self.pred_len) * self.feature_encode_dim
+
+        self.feature_encoder = ResBlock(self.feature_dim, self.res_hidden, self.feature_encode_dim, dropout, bias)
+        self.encoders = nn.Sequential(ResBlock(flatten_dim, self.res_hidden, self.hidden_dim, dropout, bias),*([ ResBlock(self.hidden_dim, self.res_hidden, self.hidden_dim, dropout, bias)]*(self.encoder_num-1)))
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            self.decoders = nn.Sequential(*([ ResBlock(self.hidden_dim, self.res_hidden, self.hidden_dim, dropout, bias)]*(self.decoder_num-1)),ResBlock(self.hidden_dim, self.res_hidden, self.decode_dim * self.pred_len, dropout, bias))
+            self.temporalDecoder = ResBlock(self.decode_dim + self.feature_encode_dim, self.temporalDecoderHidden, 1, dropout, bias)
+            self.residual_proj = nn.Linear(self.seq_len, self.pred_len, bias=bias)
+        if self.task_name == 'imputation':
+            self.decoders = nn.Sequential(*([ ResBlock(self.hidden_dim, self.res_hidden, self.hidden_dim, dropout, bias)]*(self.decoder_num-1)),ResBlock(self.hidden_dim, self.res_hidden, self.decode_dim * self.seq_len, dropout, bias))
+            self.temporalDecoder = ResBlock(self.decode_dim + self.feature_encode_dim, self.temporalDecoderHidden, 1, dropout, bias)
+            self.residual_proj = nn.Linear(self.seq_len, self.seq_len, bias=bias)
+        if self.task_name == 'anomaly_detection':
+            self.decoders = nn.Sequential(*([ ResBlock(self.hidden_dim, self.res_hidden, self.hidden_dim, dropout, bias)]*(self.decoder_num-1)),ResBlock(self.hidden_dim, self.res_hidden, self.decode_dim * self.seq_len, dropout, bias))
+            self.temporalDecoder = ResBlock(self.decode_dim + self.feature_encode_dim, self.temporalDecoderHidden, 1, dropout, bias)
+            self.residual_proj = nn.Linear(self.seq_len, self.seq_len, bias=bias)
+            
+        
+    def forecast(self, x_enc, x_mark_enc, x_dec, batch_y_mark):
+        # Normalization
+        means = x_enc.mean(1, keepdim=True).detach()
+        x_enc = x_enc - means
+        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x_enc /= stdev
+        
+        feature = self.feature_encoder(batch_y_mark)
+        hidden = self.encoders(torch.cat([x_enc, feature.reshape(feature.shape[0], -1)], dim=-1))
+        decoded = self.decoders(hidden).reshape(hidden.shape[0], self.pred_len, self.decode_dim)
+        dec_out = self.temporalDecoder(torch.cat([feature[:,self.seq_len:], decoded], dim=-1)).squeeze(-1) + self.residual_proj(x_enc)
+        
+        
+        # De-Normalization 
+        dec_out = dec_out * (stdev[:, 0].unsqueeze(1).repeat(1, self.pred_len))
+        dec_out = dec_out + (means[:, 0].unsqueeze(1).repeat(1, self.pred_len))
+        return dec_out
     
+    def imputation(self, x_enc, x_mark_enc, x_dec, batch_y_mark, mask):
+        # Normalization
+        means = x_enc.mean(1, keepdim=True).detach()
+        x_enc = x_enc - means
+        stdev = torch.sqrt(torch.var(x_enc, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        x_enc /= stdev
 
-class TiDEEncoder(nn.Module):
-    '''
-    The encoder block of TiDE.
-    Consists of a stack of residual blocks.
-
-    Note:
-    The encoder internal layer sizes are all set to hiddenSize and 
-    the total number of layers in the encoder is set to ne(numEncoderLayers)
-
-    The input to the encoder layer has to be stacked and flattened, 
-    past and future projected covariates: X(1, L + H) has to be projected to lower dimension
-    '''
-    def __init__(self, in_features, hid_features, out_features, drop_prob, num_blocks=1):
-        super(TiDEEncoder, self).__init__()
-        self.blocks = nn.ModuleList()
-        for i in range(num_blocks):
-            self.blocks.append(ResidualBlock(in_features, hid_features, out_features, drop_prob))
-            in_features = out_features
-
-    def forward(self, x):
-        '''
-        Here x is the concatenation of the following three elements:
-        1. past and future projected covariates: X(1, L + H)
-        2. past of the time seires: Y(1, L)
-        3. static covariates: a(i)
-        '''
-        for block in self.blocks:
-            x = block(x)
-
-        return x
+        feature = self.feature_encoder(x_mark_enc)
+        hidden = self.encoders(torch.cat([x_enc, feature.reshape(feature.shape[0], -1)], dim=-1))
+        decoded = self.decoders(hidden).reshape(hidden.shape[0], self.seq_len, self.decode_dim)
+        dec_out = self.temporalDecoder(torch.cat([feature[:,:self.seq_len], decoded], dim=-1)).squeeze(-1) + self.residual_proj(x_enc)
     
-
-class TiDEDenseDecoder(nn.Module):
-    '''
-    The dense decoder block of TiDE.
-    It maps the encoded hidden representations into future predictions of time series
-    Also consists of a stack of residual blocks.
-
-    Note:
-    The hidden layer size of the dense encoder is the same as the hidden layer size of the encoder.
-    The decoder output size has to be a vector with size p * H, where H is future time steps and p is the expected dimension of decoder output of a single time step vector.
-    '''
-    def __init__(self, in_features, hid_features, out_features, drop_prob, num_blocks=1):
-        super(TiDEDenseDecoder, self).__init__()
-        self.blocks = nn.ModuleList()
-        for i in range(num_blocks):
-            self.blocks.append(ResidualBlock(in_features, hid_features, out_features, drop_prob))
-            in_features = out_features
-
-    def forward(self, x):
-        '''
-        Here x is the encoded hidden representation of the time series.
-        '''
-        for block in self.blocks:
-            x = block(x)
-
-        return x
+        # De-Normalization 
+        dec_out = dec_out * (stdev[:, 0].unsqueeze(1).repeat(1, self.seq_len))
+        dec_out = dec_out + (means[:, 0].unsqueeze(1).repeat(1, self.seq_len))
+        return dec_out
     
-class TiDETemporalDecoder(nn.Module):
-    '''
-    The temporal decoder block of TiDE.
-
-    A residual block with output size 1 (the prediction), 
-    that maps the decoded vector at time step t concatenated with the corresponding projected covariate.
-
-    This can be useful if some covariated have a strong direct effect on a particular time-step's actual value
-    '''
-    def __init__(self, in_features, hid_features, drop_prob):
-        super(TiDETemporalDecoder, self).__init__()
-        self.residual = ResidualBlock(in_features, hid_features, 1, drop_prob)
-
-    def forward(self, x):
-        '''
-        Here x is the concatenation of the following two elements:
-        1. decoded vector at time step t: y(t)
-        2. corresponding projected covariate: X(t)
-        '''
-        return self.residual(x)
     
-class TiDEModel(nn.Module):
-    '''
-    TiDE model, consisting of the encoder, dense decoder and temporal decoder.
-
-    The input data consists of three parts:
-    1. Lookback y(1: L)
-    2. Static attributes a(i)
-    3. Dynamic covariates X(1: L + H)
-    '''
-    def __init__(self, sizes, args):
-        super(TiDEModel, self).__init__()
-        self.lookback_shape = sizes['lookback']
-        self.attr_shape = sizes['attr']
-        self.dynCov_shape = sizes['dynCov']
-        self.label_len = args.lookback_len  # lookback length L
-        self.seq_len = args.seq_len         # sequence length
-        self.pred_len = args.pred_len       # prediction length H
-        self.args = args
-
-        # hyperparameters
-        self.feat_size = args.feat_size
-        self.hidden_size = args.hidden_size
-        self.num_encoder_layers = args.num_encoder_layers
-        self.num_decoder_layers = args.num_decoder_layers
-        self.decoder_output_dim = args.decoder_output_dim
-        self.temporal_decoder_hidden = args.temporal_decoder_hidden
-        self.drop_prob = args.drop_prob
-        self.layer_norm = True
-        self.lr = args.lr
-        self.batch_size = args.batch_size
-
-        # the concat shape is the combined size of three flattened tensor
-        self.concat_shape = self.label_len * self.lookback_shape[1] + self.attr_shape[0] * self.attr_shape[1] + self.dynCov_shape[0] * self.feat_size
-        # modules
-        self.featproj = ResidualBlock(self.dynCov_shape[1], self.hidden_size, self.feat_size, self.drop_prob)
-        self.encoder = TiDEEncoder(self.concat_shape, self.hidden_size, self.hidden_size, self.drop_prob, self.num_encoder_layers)
-        self.denseDecoder = TiDEDenseDecoder(self.hidden_size, self.hidden_size, self.decoder_output_dim * self.pred_len, self.drop_prob, self.num_decoder_layers)
-        self.temporalDecoder = TiDETemporalDecoder(self.feat_size + self.decoder_output_dim, self.temporal_decoder_hidden, self.drop_prob)
-        self.linear = nn.Linear(self.label_len, self.pred_len)
-
-    def forward(self, batch_x, batch_y, batch_x_mark, batch_y_mark):
-        '''
-        batch_x: attributes
-        batch_y: look back
-        batch_x_mark: Dynamic covariates
-
-        Here lookback, attr and dynCov are the three input data parts.
-        Each input has three dimensions: (batch_size, time_steps, feature_size).
-        '''
-        # Feature projection
-        proj_feature = self.featproj(batch_y_mark)
-        batch_y_ = batch_y[:, : self.label_len, :]
-
-        # Encoder processing
-        # first flatten and concatenate the input data
-        proj_feature_ = proj_feature.view(self.batch_size, -1)
-        batch_x_ = batch_x.view(self.batch_size, -1)
-        batch_y_ = batch_y_.view(self.batch_size, -1)
-        encoder_input = torch.cat((proj_feature_, batch_x_, batch_y_), dim=1)
-
-        encoded = self.encoder(encoder_input.float())
-
-        # Dense decoder processing
-        denseDecoded = self.denseDecoder(encoded)
-
-        # unflatten the decoded vector
-        denseDecoded = denseDecoded.view(self.batch_size, self.pred_len, self.decoder_output_dim)
-        pred_feat = proj_feature[:, -self.pred_len:, :]
-        # stack the two
-        denseDecoded = torch.cat((denseDecoded, pred_feat), dim=2)
-
-        # Temporal decoder
-        temporalDecoded = self.temporalDecoder(denseDecoded)
-
-        # lookback residual
-        res_lookback = self.linear(batch_y_)
-        pred = temporalDecoded + res_lookback.unsqueeze(-1)
-        ans = batch_y[:, -self.pred_len:, :]
-
-        return pred, ans
+    def forward(self, x_enc, x_mark_enc, x_dec, batch_y_mark, mask=None):
+        '''x_mark_enc is the exogenous dynamic feature described in the original paper'''
+        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
+            if batch_y_mark is None:
+                batch_y_mark = torch.zeros((x_enc.shape[0], self.seq_len+self.pred_len, self.feature_dim)).to(x_enc.device).detach()
+            else:
+                batch_y_mark = torch.concat([x_mark_enc, batch_y_mark[:, -self.pred_len:, :]],dim=1)
+            dec_out = torch.stack([self.forecast(x_enc[:, :, feature], x_mark_enc, x_dec, batch_y_mark) for feature in range(x_enc.shape[-1])],dim=-1)
+            return dec_out # [B, L, D]
+        if self.task_name == 'imputation':
+            dec_out = torch.stack([self.imputation(x_enc[:, :, feature], x_mark_enc, x_dec, batch_y_mark, mask) for feature in range(x_enc.shape[-1])],dim=-1)
+            return dec_out  # [B, L, D]
+        if self.task_name == 'anomaly_detection':
+            raise NotImplementedError("Task anomaly_detection for Tide is temporarily not supported")
+        if self.task_name == 'classification':
+            raise NotImplementedError("Task classification for Tide is temporarily not supported")
+        return None
